@@ -47,6 +47,7 @@ import os
 import re
 import sys
 import math
+import argparse
 
 if __name__ == '__main__':
     import Globals
@@ -6171,209 +6172,248 @@ if __name__ == '__main__':
     from Products.ZenUtils.ZenScriptBase import ZenScriptBase
 
     class ZPLCommand(ZenScriptBase):
-        def run(self):
-            args = sys.argv[1:]
+        def getargs(self):
+            parser = argparse.ArgumentParser(
+                description=__doc__,
+                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+            subparsers = parser.add_subparsers()
+            
+            lint_parser = subparsers.add_parser('lint', help='check format of YAML spec')
+            lint_parser.add_argument('filename', help='path to the file to check')
+            lint_parser.set_defaults(func=self.lint)
+            
+            py_to_yaml_parser = subparsers.add_parser(
+                'py_to_yaml',
+                help='convert old, code-based ZenPackSpec to YAML')
+            py_to_yaml_parser.add_argument('zenpack_name', help='I have no idea, sorry') #FIXME
+            py_to_yaml_parser.set_defaults(func=self.py_to_yaml)
+            
+            dump_templates_parser = subparsers.add_parser(
+                'dump_templates',
+                help='encode existing monitoring templates to ZPL-compatible YAML')
+            dump_templates_parser.add_argument(
+                'zenpack_name',
+                help='the name of the ZenPack from which to extract monitoring templates')
+            dump_templates_parser.set_defaults(func=self.dump_templates)
+            
+            class_diagram_parser = subparsers.add_parser(
+                'class_diagram',
+                help='produce a class diagram in YUML format')
+            class_diagram_parser.add_argument(
+                'diagram_type',
+                choices=('yuml',),
+                help='type of the diagram encoding')
+            class_diagram_parser.add_argument(
+                'filename',
+                help='path to file into which to save diagram')
+            class_diagram_parser.set_defaults(func=self.class_diagram)
+            
+            list_paths_parser = subparsers.add_parser(
+                'list_paths',
+                help='No idea.') #FIXME
+            list_paths_parser.add_argument('device_name', help='the name of the device in question')
+            list_paths_parser.set_defaults(func=self.list_paths)
+            
+            create_parser = subparsers.add_parser('create', help='create a ZPL skeleton')
+            create_parser.add_argument('zenpack_name', help='name for the prospective ZenPack')
+            create_parser.set_defaults(func=self.create)
+            
+            version_parser = subparsers.add_parser('version', help='print this ZPL\'s version')
+            version_parser.set_defaults(self.version)
+        
+        def lint(self, args):
+            with open(args.filename, 'r') as file:
+                linecount = len(file.readlines())
 
-            if len(args) == 2 and args[0] == 'lint':
-                filename = args[1]
+            # Change our logging output format.
+            logging.getLogger().handlers = []
+            for logger in logging.Logger.manager.loggerDict.values():
+                logger.handlers = []
+            handler = logging.StreamHandler(sys.stdout)
+            formatter = logging.Formatter(
+                fmt='%s:%s:0: %%(message)s' % (args.filename, linecount))
+            handler.setFormatter(formatter)
+            logging.getLogger().addHandler(handler)
 
-                with open(filename, 'r') as file:
-                    linecount = len(file.readlines())
+            try:
+                with open(args.filename, 'r') as stream:
+                    yaml.load(stream, Loader=WarningLoader)
+            except Exception, e:
+                LOG.exception(e)
+        
+        def py_to_yaml(self, args):
+            self.connect()
+            zenpack = self.dmd.ZenPackManager.packs._getOb(args.zenpack_name)
+            if zenpack is None:
+                LOG.error("ZenPack '%s' not found." % args.zenpack_name)
+                return
+            zenpack_init_py = os.path.join(os.path.dirname(inspect.getfile(zenpack.__class__)), '__init__.py')
 
-                # Change our logging output format.
-                logging.getLogger().handlers = []
-                for logger in logging.Logger.manager.loggerDict.values():
-                    logger.handlers = []
-                handler = logging.StreamHandler(sys.stdout)
-                formatter = logging.Formatter(
-                    fmt='%s:%s:0: %%(message)s' % (filename, linecount))
-                handler.setFormatter(formatter)
-                logging.getLogger().addHandler(handler)
+            # create a dummy zenpacklib sufficient to be used in an
+            # __init__.py, so we can capture export the data.
+            zenpacklib_module = create_module("zenpacklib")
+            zenpacklib_module.ZenPackSpec = type('ZenPackSpec', (dict,), {})
+            zenpack_schema_module = create_module("schema")
+            zenpack_schema_module.ZenPack = ZenPackBase
 
-                try:
-                    with open(filename, 'r') as stream:
-                        yaml.load(stream, Loader=WarningLoader)
-                except Exception, e:
-                    LOG.exception(e)
+            def zpl_create(self):
+                zenpacklib_module.CFG = dict(self)
+            zenpacklib_module.ZenPackSpec.create = zpl_create
 
-            elif len(args) == 2 and args[0] == 'py_to_yaml':
-                zenpack_name = args[1]
+            stream = open(zenpack_init_py, 'r')
+            inputfile = stream.read()
 
-                self.connect()
-                zenpack = self.dmd.ZenPackManager.packs._getOb(zenpack_name)
-                if zenpack is None:
-                    LOG.error("ZenPack '%s' not found." % zenpack_name)
-                    return
-                zenpack_init_py = os.path.join(os.path.dirname(inspect.getfile(zenpack.__class__)), '__init__.py')
+            # tweak the input slightly.
+            inputfile = re.sub(r'from .* import zenpacklib', '', inputfile)
+            inputfile = re.sub(r'from .* import schema', '', inputfile)
+            inputfile = re.sub(r'__file__', '"%s"' % zenpack_init_py, inputfile)
 
-                # create a dummy zenpacklib sufficient to be used in an
-                # __init__.py, so we can capture export the data.
-                zenpacklib_module = create_module("zenpacklib")
-                zenpacklib_module.ZenPackSpec = type('ZenPackSpec', (dict,), {})
-                zenpack_schema_module = create_module("schema")
-                zenpack_schema_module.ZenPack = ZenPackBase
+            # Kludge 'from . import' into working.
+            import site
+            site.addsitedir(os.path.dirname(zenpack_init_py))
+            inputfile = re.sub(r'from . import', 'import', inputfile)
 
-                def zpl_create(self):
-                    zenpacklib_module.CFG = dict(self)
-                zenpacklib_module.ZenPackSpec.create = zpl_create
+            g = dict(zenpacklib=zenpacklib_module, schema=zenpack_schema_module)
+            l = dict()
+            exec inputfile in g, l
 
-                stream = open(zenpack_init_py, 'r')
-                inputfile = stream.read()
+            CFG = zenpacklib_module.CFG
+            CFG['name'] = args.zenpack_name
 
-                # tweak the input slightly.
-                inputfile = re.sub(r'from .* import zenpacklib', '', inputfile)
-                inputfile = re.sub(r'from .* import schema', '', inputfile)
-                inputfile = re.sub(r'__file__', '"%s"' % zenpack_init_py, inputfile)
+            # convert the cfg dictionary to yaml
+            specparams = ZenPackSpecParams(**CFG)
 
-                # Kludge 'from . import' into working.
-                import site
-                site.addsitedir(os.path.dirname(zenpack_init_py))
-                inputfile = re.sub(r'from . import', 'import', inputfile)
+            # Dig around in ZODB and add any defined monitoring templates
+            # to the spec.
+            templates = self.zenpack_templatespecs(args.zenpack_name)
+            for dc_name in templates:
+                if dc_name not in specparams.device_classes:
+                    LOG.warning("Device class '%s' was not defined in %s - adding to the YAML file.  You may need to adjust the 'create' and 'remove' options.",
+                                dc_name, zenpack_init_py)
+                    specparams.device_classes[dc_name] = DeviceClassSpecParams(specparams, dc_name)
 
-                g = dict(zenpacklib=zenpacklib_module, schema=zenpack_schema_module)
-                l = dict()
-                exec inputfile in g, l
+                # And merge in the templates we found in ZODB.
+                specparams.device_classes[dc_name].templates.update(templates[dc_name])
 
-                CFG = zenpacklib_module.CFG
-                CFG['name'] = zenpack_name
+            outputfile = yaml.dump(specparams, Dumper=Dumper)
 
-                # convert the cfg dictionary to yaml
-                specparams = ZenPackSpecParams(**CFG)
+            # tweak the yaml slightly.
+            outputfile = outputfile.replace("__builtin__.object", "object")
+            outputfile = re.sub(r"!!float '(\d+)'", r"\1", outputfile)
 
-                # Dig around in ZODB and add any defined monitoring templates
-                # to the spec.
-                templates = self.zenpack_templatespecs(zenpack_name)
-                for dc_name in templates:
-                    if dc_name not in specparams.device_classes:
-                        LOG.warning("Device class '%s' was not defined in %s - adding to the YAML file.  You may need to adjust the 'create' and 'remove' options.",
-                                    dc_name, zenpack_init_py)
-                        specparams.device_classes[dc_name] = DeviceClassSpecParams(specparams, dc_name)
+            print outputfile
+        
+        def dump_templates(self, args):
+            self.connect()
 
-                    # And merge in the templates we found in ZODB.
-                    specparams.device_classes[dc_name].templates.update(templates[dc_name])
+            templates = self.zenpack_templatespecs(args.zenpack_name)
+            zpsp = ZenPackSpecParams(args.zenpack_name, device_classes={x: {} for x in templates})
+            for dc_name in templates:
+                zpsp.device_classes[dc_name].templates = templates[dc_name]
 
-                outputfile = yaml.dump(specparams, Dumper=Dumper)
+            print yaml.dump(zpsp, Dumper=Dumper)
+        
+        def class_diagram(self, args):
+            with open(args.filename, 'r') as stream:
+                CFG = yaml.load(stream, Loader=Loader)
 
-                # tweak the yaml slightly.
-                outputfile = outputfile.replace("__builtin__.object", "object")
-                outputfile = re.sub(r"!!float '(\d+)'", r"\1", outputfile)
+            if args.diagram_type == 'yuml':
+                print "# Classes"
+                for cname in sorted(CFG.classes):
+                    print "[{}]".format(cname)
 
-                print outputfile
+                print "\n# Inheritence"
+                for cname in CFG.classes:
+                    cspec = CFG.classes[cname]
+                    for baseclass in cspec.bases:
+                        if type(baseclass) != str:
+                            baseclass = aq_base(baseclass).__name__
+                        print "[{}]^-[{}]".format(baseclass, cspec.name)
 
-            elif len(args) == 2 and args[0] == 'dump_templates':
-                zenpack_name = args[1]
-                self.connect()
+                print "\n# Containing Relationships"
+                for crspec in CFG.class_relationships:
+                    if crspec.cardinality == '1:MC':
+                        print "[{}]++{}-{}[{}]".format(
+                            crspec.left_class, crspec.left_relname,
+                            crspec.right_relname, crspec.right_class)
 
-                templates = self.zenpack_templatespecs(zenpack_name)
-                zpsp = ZenPackSpecParams(zenpack_name, device_classes={x: {} for x in templates})
-                for dc_name in templates:
-                    zpsp.device_classes[dc_name].templates = templates[dc_name]
-
-                print yaml.dump(zpsp, Dumper=Dumper)
-
-            elif len(args) == 3 and args[0] == "class_diagram":
-                diagram_type = args[1]
-                filename = args[2]
-
-                with open(filename, 'r') as stream:
-                    CFG = yaml.load(stream, Loader=Loader)
-
-                if diagram_type == 'yuml':
-                    print "# Classes"
-                    for cname in sorted(CFG.classes):
-                        print "[{}]".format(cname)
-
-                    print "\n# Inheritence"
-                    for cname in CFG.classes:
-                        cspec = CFG.classes[cname]
-                        for baseclass in cspec.bases:
-                            if type(baseclass) != str:
-                                baseclass = aq_base(baseclass).__name__
-                            print "[{}]^-[{}]".format(baseclass, cspec.name)
-
-                    print "\n# Containing Relationships"
-                    for crspec in CFG.class_relationships:
-                        if crspec.cardinality == '1:MC':
-                            print "[{}]++{}-{}[{}]".format(
-                                crspec.left_class, crspec.left_relname,
-                                crspec.right_relname, crspec.right_class)
-
-                    print "\n# Non-Containing Relationships"
-                    for crspec in CFG.class_relationships:
-                        if crspec.cardinality == '1:1':
-                            print "[{}]{}-.-{}[{}]".format(
-                                crspec.left_class, crspec.left_relname,
-                                crspec.right_relname, crspec.right_class)
-                        if crspec.cardinality == '1:M':
-                            print "[{}]{}-.-{}++[{}]".format(
-                                crspec.left_class, crspec.left_relname,
-                                crspec.right_relname, crspec.right_class)
-                        if crspec.cardinality == 'M:M':
-                            print "[{}]++{}-.-{}++[{}]".format(
-                                crspec.left_class, crspec.left_relname,
-                                crspec.right_relname, crspec.right_class)
-                else:
-                    LOG.error("Diagram type '%s' is not supported.", diagram_type)
-
-            elif len(args) == 2 and args[0] == "list_paths":
-                self.connect()
-                device = self.dmd.Devices.findDevice(args[1])
-                if device is None:
-                    LOG.error("Device '%s' not found." % args[1])
-                    return
-
-                from Acquisition import aq_chain
-                from Products.ZenRelations.RelationshipBase import RelationshipBase
-
-                all_paths = set()
-                included_paths = set()
-                class_summary = collections.defaultdict(set)
-
-                for component in device.getDeviceComponents():
-                    for facet in component.get_facets(recurse_all=True):
-                        path = []
-                        for obj in aq_chain(facet):
-                            if obj == component:
-                                break
-                            if isinstance(obj, RelationshipBase):
-                                path.insert(0, obj.id)
-                        all_paths.add(component.meta_type + ":" + "/".join(path) + ":" + facet.meta_type)
-
-                    for facet in component.get_facets():
-                        path = []
-                        for obj in aq_chain(facet):
-                            if obj == component:
-                                break
-                            if isinstance(obj, RelationshipBase):
-                                path.insert(0, obj.id)
-                        included_paths.add(component.meta_type + ":" + "/".join(path) + ":" + facet.meta_type)
-                        class_summary[component.meta_type].add(facet.meta_type)
-
-                print "Paths\n-----\n"
-                for path in sorted(all_paths):
-                    if path in included_paths:
-                        if "/" not in path:
-                            # normally all direct relationships are included
-                            print "DIRECT  " + path
-                        else:
-                            # sometimes extra paths are pulled in due to extra_paths
-                            # configuration.
-                            print "EXTRA   " + path
-                    else:
-                        print "EXCLUDE " + path
-
-                print "\nClass Summary\n-------------\n"
-                for source_class in sorted(class_summary.keys()):
-                    print "%s is reachable from %s" % (source_class, ", ".join(sorted(class_summary[source_class])))
-
-            elif len(args) == 2 and args[0] == "create":
-                create_zenpack_srcdir(args[1])
-
-            elif len(args) == 1 and args[0] == "version":
-                print __version__
-
+                print "\n# Non-Containing Relationships"
+                for crspec in CFG.class_relationships:
+                    if crspec.cardinality == '1:1':
+                        print "[{}]{}-.-{}[{}]".format(
+                            crspec.left_class, crspec.left_relname,
+                            crspec.right_relname, crspec.right_class)
+                    if crspec.cardinality == '1:M':
+                        print "[{}]{}-.-{}++[{}]".format(
+                            crspec.left_class, crspec.left_relname,
+                            crspec.right_relname, crspec.right_class)
+                    if crspec.cardinality == 'M:M':
+                        print "[{}]++{}-.-{}++[{}]".format(
+                            crspec.left_class, crspec.left_relname,
+                            crspec.right_relname, crspec.right_class)
             else:
-                print USAGE.format(sys.argv[0])
+                LOG.error("Diagram type '%s' is not supported.", args.diagram_type)
+        
+        def list_paths(self, args):
+            self.connect()
+            device = self.dmd.Devices.findDevice(args.device_name)
+            if device is None:
+                LOG.error("Device '%s' not found." % args.device_name)
+                return
+
+            from Acquisition import aq_chain
+            from Products.ZenRelations.RelationshipBase import RelationshipBase
+
+            all_paths = set()
+            included_paths = set()
+            class_summary = collections.defaultdict(set)
+
+            for component in device.getDeviceComponents():
+                for facet in component.get_facets(recurse_all=True):
+                    path = []
+                    for obj in aq_chain(facet):
+                        if obj == component:
+                            break
+                        if isinstance(obj, RelationshipBase):
+                            path.insert(0, obj.id)
+                    all_paths.add(component.meta_type + ":" + "/".join(path) + ":" + facet.meta_type)
+
+                for facet in component.get_facets():
+                    path = []
+                    for obj in aq_chain(facet):
+                        if obj == component:
+                            break
+                        if isinstance(obj, RelationshipBase):
+                            path.insert(0, obj.id)
+                    included_paths.add(component.meta_type + ":" + "/".join(path) + ":" + facet.meta_type)
+                    class_summary[component.meta_type].add(facet.meta_type)
+
+            print "Paths\n-----\n"
+            for path in sorted(all_paths):
+                if path in included_paths:
+                    if "/" not in path:
+                        # normally all direct relationships are included
+                        print "DIRECT  " + path
+                    else:
+                        # sometimes extra paths are pulled in due to extra_paths
+                        # configuration.
+                        print "EXTRA   " + path
+                else:
+                    print "EXCLUDE " + path
+
+            print "\nClass Summary\n-------------\n"
+            for source_class in sorted(class_summary.keys()):
+                print "%s is reachable from %s" % (source_class, ", ".join(sorted(class_summary[source_class])))
+        
+        def create(self, args):
+            create_zenpack_srcdir(args.zenpack_name)
+        
+        def version(self, args):
+            print __version__
+        
+        def run(self):
+            args = self.getargs()
+            args.func(args)
 
         def zenpack_templatespecs(self, zenpack_name):
             zenpack = self.dmd.ZenPackManager.packs._getOb(zenpack_name, None)
